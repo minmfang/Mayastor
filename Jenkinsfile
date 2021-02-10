@@ -13,7 +13,11 @@ def k8s_job=""
 xray_projectkey='MQ'
 xray_on_demand_testplan='MQ-1'
 xray_nightly_testplan='MQ-17'
+xray_continuous_testplan='MQ-33'
 xray_test_execution_type='10059'
+
+// if e2e run does not build its own images, which tag to use when pulling
+e2e_image_tag='v0.7.1'
 
 // Searches previous builds to find first non aborted one
 def getLastNonAbortedBuild(build) {
@@ -26,6 +30,19 @@ def getLastNonAbortedBuild(build) {
   } else {
     return build;
   }
+}
+
+def getTestPlan() {
+  if (params.e2e_continuous == true)  {
+    return xray_continuous_testplan
+  }
+  def causes = currentBuild.getBuildCauses()
+  for(cause in causes) {
+    if ("${cause}".contains("hudson.triggers.TimerTrigger\$TimerTriggerCause")) {
+      return xray_nightly_testplan
+    }
+  }
+  return xray_on_demand_testplan
 }
 
 // Send out a slack message if branch got broken or has recovered
@@ -48,15 +65,14 @@ def notifySlackUponStateChange(build) {
     }
   }
 }
-
-def getTestPlan() {
-  def causes = currentBuild.getBuildCauses()
-  for(cause in causes) {
-    if ("${cause}".contains("hudson.triggers.TimerTrigger\$TimerTriggerCause")) {
-      return xray_nightly_testplan
-    }
+def notifySlackUponE2ECompletion(build) {
+  if (build.getResult() != 'SUCCESS') {
+    slackSend(
+      channel: '#mayastor-backend',
+      color: 'danger',
+      message: "E2E continuous testing has failed (<${env.BUILD_URL}|Open>)"
+    )
   }
-  return xray_on_demand_testplan
 }
 
 // Will ABORT current job for cases when we don't want to build
@@ -72,10 +88,36 @@ String cron_schedule = BRANCH_NAME == "develop" ? "0 2 * * *" : ""
 // Some long e2e tests are not suitable to be run for each PR
 boolean run_extended_e2e_tests = (env.BRANCH_NAME != 'staging' && env.BRANCH_NAME != 'trying') ? true : false
 
+// Determine which stages to run
+if (params.e2e_continuous == true) {
+  run_linter = false
+  rust_test = false
+  grpc_test = false
+  moac_test = false
+  e2e_test = true
+  e2e_test_set = 'install basic_volume_io csi resource_check uninstall'
+  e2e_build_images = false
+  e2e_agent = 'nixos'
+  allow_push_images = false
+} else {
+  run_linter = true
+  rust_test = true
+  grpc_test = true
+  moac_test = true
+  e2e_test = true
+  e2e_test_set = ''
+  e2e_build_images = true
+  e2e_agent = 'nixos-mayastor'
+  allow_push_images = true
+}
+
 pipeline {
   agent none
   options {
     timeout(time: 2, unit: 'HOURS')
+  }
+  parameters {
+    booleanParam(defaultValue: false, name: 'e2e_continuous')
   }
   triggers {
     cron(cron_schedule)
@@ -103,6 +145,7 @@ pipeline {
           anyOf {
             branch 'master'
             branch 'release/*'
+            expression { run_linter == false }
           }
         }
       }
@@ -125,6 +168,9 @@ pipeline {
       }
       parallel {
         stage('rust unit tests') {
+          when{
+            expression { rust_test == true }
+          }
           agent { label 'nixos-mayastor' }
           steps {
             sh 'printenv'
@@ -138,6 +184,9 @@ pipeline {
           }
         }
         stage('grpc tests') {
+          when{
+            expression { grpc_test == true }
+          }
           agent { label 'nixos-mayastor' }
           steps {
             sh 'printenv'
@@ -150,6 +199,9 @@ pipeline {
           }
         }
         stage('moac unit tests') {
+          when{
+            expression { moac_test == true }
+          }
           agent { label 'nixos-mayastor' }
           steps {
             sh 'printenv'
@@ -162,23 +214,34 @@ pipeline {
           }
         }
         stage('e2e tests') {
+          when{
+            expression { e2e_test == true }
+          }
           stages {
             stage('e2e docker images') {
-              agent { label 'nixos-mayastor' }
+              agent { label e2e_agent }
               steps {
-                // e2e tests are the most demanding step for space on the disk so we
-                // test the free space here rather than repeating the same code in all
-                // stages.
-                sh "./scripts/reclaim-space.sh 10"
-                // Build images (REGISTRY is set in jenkin's global configuration).
-                // Note: We might want to build and test dev images that have more
-                // assertions instead but that complicates e2e tests a bit.
-                sh "./scripts/release.sh --alias-tag ci --registry \"${env.REGISTRY}\""
+                script {
+                  // e2e tests are the most demanding step for space on the disk so we
+                  // test the free space here rather than repeating the same code in all
+                  // stages.
+                  sh "./scripts/reclaim-space.sh 10"
+
+                  if (e2e_build_images == true) {
+                    // Build images (REGISTRY is set in jenkin's global configuration).
+                    // Note: We might want to build and test dev images that have more
+                    // assertions instead but that complicates e2e tests a bit.
+                    sh "./scripts/release.sh --alias-tag ci --registry \"${env.REGISTRY}\""
+                  } else {
+                    // Use images from CI registry. If not present, copy them in from docker hub.
+                    sh "./scripts/registry-synch.sh \"${env.REGISTRY}\" \"${e2e_image_tag}\""
+                  }
+                }
+              }
+              post {
                 // Always remove all docker images because they are usually used just once
                 // and underlaying pkgs are already cached by nix so they can be easily
                 // recreated.
-              }
-              post {
                 always {
                   sh 'docker image prune --all --force'
                 }
@@ -202,13 +265,8 @@ pipeline {
               }
             }
             stage('run e2e') {
-              agent { label 'nixos-mayastor' }
+              agent { label e2e_agent }
               environment {
-                GIT_COMMIT_SHORT = sh(
-                  // using printf to get rid of trailing newline
-                  script: "printf \$(git rev-parse --short ${GIT_COMMIT})",
-                  returnStdout: true
-                )
                 KUBECONFIG = "${env.WORKSPACE}/${e2e_environment}/modules/k8s/secrets/admin.conf"
               }
               steps {
@@ -224,10 +282,24 @@ pipeline {
                     fingerprintArtifacts: true
                 )
                 sh 'kubectl get nodes -o wide'
+
                 script {
-                  def cmd = "./scripts/e2e-test.sh --device /dev/sdb --tag \"${env.GIT_COMMIT_SHORT}\" --registry \"${env.REGISTRY}\" --logs --logsdir \"./logs/mayastor\" "
+                  def tag = ''
+                  if (e2e_build_images == true) {
+                    tag = sh(
+                      // using printf to get rid of trailing newline
+                      script: "printf \$(git rev-parse --short ${GIT_COMMIT})",
+                      returnStdout: true
+                    )
+                  } else {
+                      tag = e2e_image_tag
+                  }
+                  def cmd = "./scripts/e2e-test.sh --device /dev/sdb --tag \"${tag}\" --registry \"${env.REGISTRY}\" --logs --logsdir \"./logs/mayastor\" "
                   if (run_extended_e2e_tests) {
                     cmd = cmd + " --extended"
+                  }
+                  if (e2e_test_set != '') {
+                      cmd = cmd + " --tests \"" + e2e_test_set + "\""
                   }
                   sh "nix-shell --run '${cmd}'"
                 }
@@ -263,8 +335,9 @@ pipeline {
                     )
                   }
                 }
-                always { // always send the junit results back to Xray and Jenkins
+                always {
                   archiveArtifacts 'logs/**/*.*'
+                  // always send the junit results back to Xray and Jenkins
                   junit 'e2e.*.xml'
                   script {
                     def xray_testplan = getTestPlan()
@@ -279,14 +352,14 @@ pipeline {
                       inputInfoSwitcher: 'fileContent',
                       importInfo: """{
                         "fields": {
-                          "summary": "Build ${env.BUILD_NUMBER}",
+                          "summary": "Build #${env.BUILD_NUMBER}, branch: ${env.BRANCH_name}",
                           "project": {
                             "key": "${xray_projectkey}"
                           },
                           "issuetype": {
                             "id": "${xray_test_execution_type}"
                           },
-                          "description": "Results for build ${env.BUILD_NUMBER} at ${env.BUILD_URL}"
+                          "description": "Results for build #${env.BUILD_NUMBER} at ${env.BUILD_URL}"
                         }
                       }"""
                     ])
@@ -319,17 +392,29 @@ pipeline {
               }
             }
           }
-        }
-      }
-    }
+          post {
+            success {
+              script {
+                if (params.e2e_continuous == true && env.E2E_ENABLE == "true") {
+                  build job: env.BRANCH_NAME, wait: false, parameters: [[$class: 'BooleanParameterValue', name: 'e2e_continuous', value: true]]
+                }
+              }
+            }
+          }
+        }// end of "e2e tests" stage
+      }// parallel stages block
+    }// end of test stage
     stage('push images') {
       agent { label 'nixos-mayastor' }
       when {
         beforeAgent true
-        anyOf {
-          branch 'master'
-          branch 'release/*'
-          branch 'develop'
+        allOf {
+          expression { allow_push_images == true }
+          anyOf {
+            branch 'master'
+            branch 'release/*'
+            branch 'develop'
+          }
         }
       }
       steps {
@@ -375,6 +460,9 @@ pipeline {
             if (env.BRANCH_NAME == 'develop') {
               notifySlackUponStateChange(currentBuild)
             }
+            //if (params.e2e_continuous == true) {
+            //   notifySlackUponE2ECompletion(currentBuild)
+            //}
           }
         }
       }
